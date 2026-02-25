@@ -2,13 +2,13 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ─── Message types ────────────────────────────────────────────────────────────
@@ -57,7 +57,8 @@ func fetchLogsCmd(c *GitHubClient, jobID int64) tea.Cmd {
 }
 
 func logPollCmd() tea.Cmd {
-	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
+	// Poll faster (1 second) to catch logs as soon as they're available
+	return tea.Tick(1*time.Second, func(_ time.Time) tea.Msg {
 		return logPollTickMsg{}
 	})
 }
@@ -147,9 +148,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = stateLogs
 					m.logContent = ""
 					m.logRaw = ""
+					m.lastLogLength = 0
 					m.logLoaded = false
 					m.autoScroll = true
-					m.selectedLogLine = 0
 					m.statusMsg = ""
 					m.updateSizes()
 					cmds = append(cmds, fetchLogsCmd(m.client, item.job.ID))
@@ -227,29 +228,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "o":
+			switch m.state {
+			case stateJobs:
+				if item, ok := m.jobsList.SelectedItem().(jobItem); ok {
+					if item.job.HTMLURL != "" {
+						if err := OpenInBrowser(item.job.HTMLURL); err != nil {
+							m.statusMsg = fmt.Sprintf("error opening browser: %v", err)
+						} else {
+							m.statusMsg = "✓ Opened job in browser"
+						}
+					} else {
+						m.statusMsg = "Job URL not available"
+					}
+				}
+				return m, nil
+			case stateLogs:
+				if m.selectedJob.HTMLURL != "" {
+					if err := OpenInBrowser(m.selectedJob.HTMLURL); err != nil {
+						m.statusMsg = fmt.Sprintf("error opening browser: %v", err)
+					} else {
+						m.statusMsg = "✓ Opened job in browser"
+					}
+				} else {
+					m.statusMsg = "Job URL not available"
+				}
+				return m, nil
+			}
+
 		case "up":
 			if m.state == stateLogs {
-				if m.selectedLogLine > 0 {
-					m.selectedLogLine--
-					if m.logRaw != "" {
-						rendered := renderLogs(m.logRaw, m.selectedLogLine)
-						m.logContent = rendered
-						m.logViewport.SetContent(rendered)
-					}
+				if m.logViewport.YOffset > 0 {
+					m.logViewport.YOffset--
+					m.autoScroll = false
 				}
 				return m, nil
 			}
 
 		case "down":
 			if m.state == stateLogs {
-				logLines := strings.Count(m.logRaw, "\n") + 1
-				if m.selectedLogLine < logLines-1 {
-					m.selectedLogLine++
-					if m.logRaw != "" {
-						rendered := renderLogs(m.logRaw, m.selectedLogLine)
-						m.logContent = rendered
-						m.logViewport.SetContent(rendered)
-					}
+				// Check if we're at the bottom
+				totalHeight := lipgloss.Height(m.logContent)
+				maxOffset := max(0, totalHeight-m.logViewport.Height)
+				
+				if m.logViewport.YOffset < maxOffset {
+					m.logViewport.YOffset++
+				}
+				
+				// Re-enable auto-scroll when at the bottom
+				if m.logViewport.YOffset >= maxOffset {
+					m.autoScroll = true
+					m.logViewport.GotoBottom()
 				}
 				return m, nil
 			}
@@ -273,7 +302,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i, r := range msg {
 			items[i] = runItem{r}
 		}
-		_ = m.runsList.SetItems(items)
+		cmds = append(cmds, m.runsList.SetItems(items))
 
 	case jobsLoadedMsg:
 		m.loading = false
@@ -281,8 +310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for i, j := range msg {
 			items[i] = jobItem{j}
 		}
-		// SetItems also accepts commands - call it but don't queue the command
-		_ = m.jobsList.SetItems(items)
+		cmds = append(cmds, m.jobsList.SetItems(items))
 		
 		// Check for new jobs (auto-jump on rerun)
 		runID := m.selectedRun.ID
@@ -330,16 +358,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logsLoadedMsg:
 		rawContent := string(msg)
-		rendered := renderLogs(rawContent, m.selectedLogLine)
-		savedOffset := m.logViewport.YOffset
-		m.logViewport.SetContent(rendered)
-		m.logContent = rendered
-		m.logRaw = rawContent
-		m.logLoaded = true
-		if m.autoScroll {
-			m.logViewport.GotoBottom()
-		} else {
-			m.logViewport.YOffset = savedOffset
+		
+		// If empty and job is still running, show waiting message
+		if rawContent == "" && m.selectedJob.Status == "in_progress" {
+			waitingMsg := "⏳ Job is running, logs will appear here when complete...\n\n" +
+				"💡 Tip: Press 'o' to open the job in your browser for live logs\n" +
+				"💡 Tip: Press 'a' to toggle auto-scroll when logs appear"
+			m.logContent = waitingMsg
+			m.logRaw = ""
+			m.logLoaded = true
+			m.logViewport.SetContent(waitingMsg)
+		} else if rawContent != "" {
+			// Detect if this is an incremental update
+			isNewContent := len(rawContent) > m.lastLogLength
+			
+			rendered := renderLogs(rawContent)
+			savedOffset := m.logViewport.YOffset
+			m.logViewport.SetContent(rendered)
+			m.logContent = rendered
+			m.logRaw = rawContent
+			m.lastLogLength = len(rawContent)
+			m.logLoaded = true
+			
+			// Auto-scroll on new content, or if not already scrolled up
+			if m.autoScroll || (isNewContent && m.logViewport.YOffset == 0) {
+				m.logViewport.GotoBottom()
+			} else if !isNewContent {
+				// No new content, preserve scroll position
+				m.logViewport.YOffset = savedOffset
+			}
 		}
 		// Continue polling while viewing logs to enable live log streaming
 		if m.state == stateLogs {

@@ -155,6 +155,7 @@ func (m model) viewJobs() string {
 	// Footer
 	footer := renderFooter([]string{
 		"<enter> logs",
+		"<o> open",
 		"<r> rerun-failed",
 		"<R> rerun-all",
 		"<esc/b> back",
@@ -227,6 +228,7 @@ func (m model) viewLogs() string {
 		"<G> bottom",
 		"<a> auto-scroll",
 		"<c> copy",
+		"<o> open",
 		"<r> refresh",
 		"<esc/b> back",
 		"<q> quit",
@@ -243,17 +245,17 @@ func (m model) viewLogs() string {
 
 // ─── Log rendering ────────────────────────────────────────────────────────────
 
-// renderLogs transforms raw log text into ANSI-styled output with optional line highlighting.
-func renderLogs(content string, selectedLine int) string {
+// renderLogs transforms raw log text into ANSI-styled output.
+func renderLogs(content string) string {
 	lines := strings.Split(content, "\n")
 	result := make([]string, len(lines))
 	for i, line := range lines {
-		result[i] = renderLogLine(line, i == selectedLine)
+		result[i] = renderLogLine(line)
 	}
 	return strings.Join(result, "\n")
 }
 
-func renderLogLine(line string, selected bool) string {
+func renderLogLine(line string) string {
 	var rendered string
 	switch {
 	case strings.HasPrefix(line, "##[group]"):
@@ -272,10 +274,6 @@ func renderLogLine(line string, selected bool) string {
 		rendered = styleCmd.Render("$ " + msg)
 	default:
 		rendered = line
-	}
-	
-	if selected && rendered != "" {
-		rendered = selectedLineStyle.Render(rendered)
 	}
 	return rendered
 }

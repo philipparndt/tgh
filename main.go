@@ -37,13 +37,13 @@ type model struct {
 	jobsList    list.Model
 
 	// stateLogs
-	selectedJob Job
-	logViewport viewport.Model
-	logContent  string         // rendered content with styling and selection
-	logRaw      string         // raw log content (unrendered)
-	logLoaded   bool
-	autoScroll  bool
-	selectedLogLine int // 0-based index of highlighted line
+	selectedJob    Job
+	logViewport    viewport.Model
+	logContent     string // rendered content with styling
+	logRaw         string // raw log content (unrendered)
+	logLoaded      bool
+	autoScroll     bool
+	lastLogLength  int // track log size to detect incremental updates
 
 	// shared
 	spinner   spinner.Model

@@ -68,11 +68,6 @@ var (
 	styleDim    = lipgloss.NewStyle().Foreground(colorGray)
 	styleHeader = lipgloss.NewStyle().Foreground(colorWhite).Bold(true)
 
-	// Selected log line — highlight entire line
-	selectedLineStyle = lipgloss.NewStyle().
-				Background(colorSelected).
-				Foreground(colorWhite)
-
 	// Status badge styles
 	statusInProgress = lipgloss.NewStyle().Foreground(colorAmber)
 	statusSuccess    = lipgloss.NewStyle().Foreground(colorGreen)

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -36,6 +38,7 @@ type Job struct {
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at"`
 	Steps       []Step    `json:"steps"`
+	HTMLURL     string    `json:"html_url"`
 }
 
 // Step represents a single step within a job.
@@ -118,6 +121,7 @@ func (c *GitHubClient) ListJobs(runID int64) ([]Job, error) {
 
 // GetJobLogs downloads and parses logs for a given job.
 // Handles both plain-text and zip-encoded responses; strips timestamps.
+// Returns empty string with no error if job is still running (logs not yet available).
 func (c *GitHubClient) GetJobLogs(jobID int64) (string, error) {
 	resp, err := c.rest.Request("GET",
 		fmt.Sprintf("repos/%s/%s/actions/jobs/%d/logs", c.owner, c.repo, jobID),
@@ -127,6 +131,11 @@ func (c *GitHubClient) GetJobLogs(jobID int64) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	// 404 means logs not yet available (job still running)
+	if resp.StatusCode == 404 {
+		return "", nil
+	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -178,6 +187,28 @@ func processLogLines(content string) string {
 		result = append(result, line)
 	}
 	return strings.Join(result, "\n")
+}
+
+// OpenInBrowser opens a URL in the default browser
+func OpenInBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "linux":
+		cmd = "xdg-open"
+		args = []string{url}
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+
+	return exec.Command(cmd, args...).Start()
 }
 
 // RerunFailedJobs triggers a re-run of only failed jobs in a workflow run.
