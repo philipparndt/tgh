@@ -35,6 +35,39 @@ archives:
       - goos: windows
         formats: [zip]
 
+brews:
+  - name: tgh
+
+    goarm: 6
+    goamd64: v1
+
+    url_template: "https://github.com/philipparndt/tgh/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+
+    commit_author:
+      name: Philipp Arndt
+      email: opensource@rnd7.de
+
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+
+    directory: Formula
+
+    homepage: "https://github.com/philipparndt/tgh"
+
+    description: "Terminal UI for browsing GitHub Actions workflow runs and job logs"
+
+    license: "MIT"
+
+    install: |
+      bin.install "tgh"
+
+    repository:
+      owner: philipparndt
+      name: homebrew-tgh
+      branch: main
+
+      pull_request:
+        enabled: false
+
 changelog:
   sort: asc
   filters:
