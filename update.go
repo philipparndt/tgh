@@ -24,6 +24,7 @@ type rerunMsg struct {
 }
 type logPollTickMsg struct{}
 type jobsPollTickMsg struct{}
+type runsPollTickMsg struct{}
 type errMsg struct{ err error }
 type pipelineInfoMsg struct{ info *pipelineServiceInfo }
 type stepLogsMsg struct {
@@ -106,6 +107,12 @@ func jobsPollCmd() tea.Cmd {
 	})
 }
 
+func runsPollCmd() tea.Cmd {
+	return tea.Tick(10*time.Second, func(_ time.Time) tea.Msg {
+		return runsPollTickMsg{}
+	})
+}
+
 func logPollCmd() tea.Cmd {
 	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
 		return logPollTickMsg{}
@@ -156,6 +163,7 @@ func fetchStepLogsCmd(info *pipelineServiceInfo, steps []Step, maxFetchedID int)
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		fetchRunsCmd(m.client),
+		runsPollCmd(),
 		m.spinner.Tick,
 	)
 }
@@ -604,6 +612,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmds = append(cmds, jobsPollCmd()) // always keep the chain alive
 		}
+
+	case runsPollTickMsg:
+		// Silently refresh runs in the background regardless of current view.
+		cmds = append(cmds, fetchRunsCmd(m.client))
+		cmds = append(cmds, runsPollCmd())
 
 	case errMsg:
 		m.loading = false

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +99,42 @@ var liveHTTPClient = &http.Client{
 	Timeout: 15 * time.Second,
 }
 
+// parseRepoURL attempts to extract host, owner, repo from a GitHub HTTP or git URL.
+// Supports:
+//   - https://host/owner/repo
+//   - git@host:owner/repo(.git)
+//
+// Returns ("", "", "", false) if the argument doesn't look like a URL.
+func parseRepoURL(arg string) (host, owner, repo string, ok bool) {
+	// HTTP(S) URL
+	if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
+		u, err := url.Parse(arg)
+		if err != nil {
+			return
+		}
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) < 2 {
+			return
+		}
+		return u.Hostname(), parts[0], strings.TrimSuffix(parts[1], ".git"), true
+	}
+	// SCP-style git URL: git@host:owner/repo.git
+	if strings.HasPrefix(arg, "git@") {
+		arg = strings.TrimPrefix(arg, "git@")
+		colonIdx := strings.Index(arg, ":")
+		if colonIdx < 0 {
+			return
+		}
+		hostPart := arg[:colonIdx]
+		parts := strings.Split(strings.Trim(arg[colonIdx+1:], "/"), "/")
+		if len(parts) < 2 {
+			return
+		}
+		return hostPart, parts[0], strings.TrimSuffix(parts[1], ".git"), true
+	}
+	return
+}
+
 // changeToRepoDir changes the current working directory to the specified repo path.
 func changeToRepoDir(repoPath string) error {
 	absPath, err := filepath.Abs(repoPath)
@@ -107,13 +144,27 @@ func changeToRepoDir(repoPath string) error {
 	return os.Chdir(absPath)
 }
 
-// NewGitHubClient creates a client scoped to the current git repository's GitHub remote.
-// Works with both github.com and GitHub Enterprise.
-// If repoPath is non-empty, uses that directory instead of the current directory.
+// NewGitHubClient creates a client scoped to a GitHub repository.
+// The optional argument may be a filesystem path, an HTTPS URL, or a git remote URL.
+// If omitted, the current directory's git remote is used.
 func NewGitHubClient(repoPath ...string) (*GitHubClient, error) {
-	// Change to repo directory if provided
-	if len(repoPath) > 0 && repoPath[0] != "" {
-		if err := changeToRepoDir(repoPath[0]); err != nil {
+	arg := ""
+	if len(repoPath) > 0 {
+		arg = repoPath[0]
+	}
+
+	// Check if the argument looks like a URL first.
+	if host, owner, repo, ok := parseRepoURL(arg); ok {
+		client, err := api.NewRESTClient(api.ClientOptions{Host: host})
+		if err != nil {
+			return nil, fmt.Errorf("could not create GitHub client: %w", err)
+		}
+		return &GitHubClient{rest: client, host: host, owner: owner, repo: repo}, nil
+	}
+
+	// Otherwise treat it as a filesystem path.
+	if arg != "" {
+		if err := changeToRepoDir(arg); err != nil {
 			return nil, fmt.Errorf("could not change to repository directory: %w", err)
 		}
 	}
@@ -136,7 +187,8 @@ func NewGitHubClient(repoPath ...string) (*GitHubClient, error) {
 	}, nil
 }
 
-// ListRuns fetches the 30 most recent workflow runs.
+// ListRuns fetches the 30 most recent workflow runs, merged with any currently
+// in_progress runs (to surface re-triggered older runs that fall outside the top 30).
 func (c *GitHubClient) ListRuns() ([]WorkflowRun, error) {
 	var result struct {
 		WorkflowRuns []WorkflowRun `json:"workflow_runs"`
@@ -145,7 +197,73 @@ func (c *GitHubClient) ListRuns() ([]WorkflowRun, error) {
 		fmt.Sprintf("repos/%s/%s/actions/runs?per_page=30", c.owner, c.repo),
 		&result,
 	)
-	return result.WorkflowRuns, err
+	if err != nil {
+		return nil, err
+	}
+
+	dbg("ListRuns: primary fetch returned %d runs", len(result.WorkflowRuns))
+
+	// Also fetch active runs (in_progress + queued) so re-triggered older runs
+	// are always visible, even on busy instances with many concurrent runs.
+	seen := make(map[int64]bool, len(result.WorkflowRuns))
+	for _, r := range result.WorkflowRuns {
+		seen[r.ID] = true
+	}
+	for _, status := range []string{"in_progress", "queued"} {
+		var active struct {
+			WorkflowRuns []WorkflowRun `json:"workflow_runs"`
+		}
+		path := fmt.Sprintf("repos/%s/%s/actions/runs?per_page=100&status=%s", c.owner, c.repo, status)
+		if e := c.rest.Get(path, &active); e != nil {
+			dbg("ListRuns: secondary fetch status=%s error: %v", status, e)
+			continue
+		}
+		dbg("ListRuns: secondary fetch status=%s returned %d runs", status, len(active.WorkflowRuns))
+		for _, r := range active.WorkflowRuns {
+			dbg("ListRuns:   run id=%d status=%s updated=%s", r.ID, r.Status, r.UpdatedAt.Format("2006-01-02 15:04:05"))
+			if !seen[r.ID] {
+				seen[r.ID] = true
+				result.WorkflowRuns = append(result.WorkflowRuns, r)
+			}
+		}
+	}
+
+	// If the status filter returned nothing (e.g. unsupported on GHES), fall back
+	// to fetching additional pages so we surface any running older runs.
+	if len(result.WorkflowRuns) == 30 {
+		dbg("ListRuns: status filter ineffective, fetching extra pages")
+		for page := 2; page <= 4; page++ {
+			var extra struct {
+				WorkflowRuns []WorkflowRun `json:"workflow_runs"`
+			}
+			path := fmt.Sprintf("repos/%s/%s/actions/runs?per_page=30&page=%d", c.owner, c.repo, page)
+			if e := c.rest.Get(path, &extra); e != nil {
+				dbg("ListRuns: extra page %d error: %v", page, e)
+				break
+			}
+			dbg("ListRuns: extra page %d returned %d runs", page, len(extra.WorkflowRuns))
+			added := 0
+			for _, r := range extra.WorkflowRuns {
+				if !seen[r.ID] && (r.Status == "in_progress" || r.Status == "queued") {
+					seen[r.ID] = true
+					result.WorkflowRuns = append(result.WorkflowRuns, r)
+					added++
+					dbg("ListRuns:   added run id=%d status=%s", r.ID, r.Status)
+				}
+			}
+			if len(extra.WorkflowRuns) < 30 {
+				break // no more pages
+			}
+			if added == 0 && page >= 3 {
+				break // no active runs found in recent pages, stop early
+			}
+		}
+	}
+	sort.Slice(result.WorkflowRuns, func(i, j int) bool {
+		return result.WorkflowRuns[i].UpdatedAt.After(result.WorkflowRuns[j].UpdatedAt)
+	})
+
+	return result.WorkflowRuns, nil
 }
 
 // ListJobs fetches jobs for a given workflow run.
