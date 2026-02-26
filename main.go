@@ -33,8 +33,10 @@ type model struct {
 	runsList list.Model
 
 	// stateJobs
-	selectedRun WorkflowRun
-	jobsList    list.Model
+	selectedRun      WorkflowRun
+	jobsList         list.Model
+	jobsPolling      bool            // true while polling for job status updates
+	jobsPollStartIDs map[int64]bool  // job IDs snapshot at rerun time; non-nil = waiting for new IDs
 
 	// stateLogs
 	selectedJob    Job
@@ -44,6 +46,24 @@ type model struct {
 	logLoaded      bool
 	autoScroll     bool
 	lastLogLength  int // track log size to detect incremental updates
+
+	// live streaming (running jobs)
+	liveStreaming      bool   // currently using the undocumented live endpoint
+	liveChangeID       int    // cursor for the next change_id request
+	liveLogs           string // accumulated raw log content from live stream
+	liveFailedAttempts int    // consecutive attempts that returned endpointOK=false
+
+	// blob range polling (fallback for running jobs)
+	logBlobURL    string // Azure blob URL obtained from the REST redirect
+	logBlobOffset int64  // next byte offset for Range requests
+
+	// GHES per-step log fetching
+	pipelineInfo    *pipelineServiceInfo // non-nil when on GHES with a running job
+	stepLogsFetched int                  // max log record ID fetched via pipeline service
+
+	// log filter
+	logFilter     string // current filter text (empty = no filter)
+	logFilterMode bool   // true while filter bar is focused
 
 	// shared
 	spinner   spinner.Model
@@ -305,26 +325,39 @@ func relativeTime(t time.Time) string {
 func main() {
 	// Parse command-line arguments
 	var repoPath string
-	
-	if len(os.Args) > 1 {
-		arg := os.Args[1]
-		// Handle help flags
-		if arg == "-h" || arg == "--help" || arg == "help" {
-			fmt.Println("Usage: tgh [REPO_PATH]")
+	var debugFile string
+
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "-h", "--help", "help":
+			fmt.Println("Usage: tgh [REPO_PATH] [--debug <filename>]")
 			fmt.Println()
 			fmt.Println("tgh is a terminal UI for browsing GitHub Actions job logs")
 			fmt.Println()
 			fmt.Println("Arguments:")
-			fmt.Println("  REPO_PATH  Optional path to a git repository")
+			fmt.Println("  REPO_PATH          Optional path to a git repository")
+			fmt.Println("  --debug <filename> Write debug log to the given file")
 			fmt.Println()
 			fmt.Println("Examples:")
-			fmt.Println("  tgh                    # Run in current directory")
-			fmt.Println("  tgh /path/to/repo      # Run in specified directory")
-			fmt.Println("  tgh ../my-project      # Run in relative path")
+			fmt.Println("  tgh                         # Run in current directory")
+			fmt.Println("  tgh /path/to/repo           # Run in specified directory")
+			fmt.Println("  tgh --debug /tmp/tgh.log    # Run with debug logging")
 			os.Exit(0)
+		case "--debug":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: --debug requires a filename argument")
+				os.Exit(1)
+			}
+			i++
+			debugFile = args[i]
+		default:
+			repoPath = arg
 		}
-		repoPath = arg
 	}
+
+	initDebugLog(debugFile)
 
 	// Create GitHub client with optional repo path
 	client, err := NewGitHubClient(repoPath)

@@ -68,6 +68,11 @@ var (
 	styleDim    = lipgloss.NewStyle().Foreground(colorGray)
 	styleHeader = lipgloss.NewStyle().Foreground(colorWhite).Bold(true)
 
+	// Filter bar (log search)
+	filterBarStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Foreground(colorCyan)
+
 	// Status badge styles
 	statusInProgress = lipgloss.NewStyle().Foreground(colorAmber)
 	statusSuccess    = lipgloss.NewStyle().Foreground(colorGreen)

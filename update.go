@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -22,7 +23,13 @@ type rerunMsg struct {
 	jobID   int64 // job ID of the retriggered job, if known
 }
 type logPollTickMsg struct{}
+type jobsPollTickMsg struct{}
 type errMsg struct{ err error }
+type pipelineInfoMsg struct{ info *pipelineServiceInfo }
+type stepLogsMsg struct {
+	content      string
+	maxFetchedID int
+}
 
 // ─── Command helpers ──────────────────────────────────────────────────────────
 
@@ -56,9 +63,51 @@ func fetchLogsCmd(c *GitHubClient, jobID int64) tea.Cmd {
 	}
 }
 
+// isRunning reports whether a job status means the job hasn't finished.
+func isRunning(status string) bool {
+	return status == "in_progress" || status == "queued"
+}
+
+// countCompletedSteps returns the number of completed steps in a job.
+func countCompletedSteps(steps []Step) int {
+	count := 0
+	for _, s := range steps {
+		if s.Status == "completed" {
+			count++
+		}
+	}
+	return count
+}
+
+// applyLogFilter re-renders the log viewport from m.logRaw, applying m.logFilter.
+func (m *model) applyLogFilter() {
+	content := m.logRaw
+	if m.logFilter != "" {
+		lower := strings.ToLower(m.logFilter)
+		var filtered []string
+		for _, line := range strings.Split(content, "\n") {
+			if strings.Contains(strings.ToLower(line), lower) {
+				filtered = append(filtered, line)
+			}
+		}
+		content = strings.Join(filtered, "\n")
+	}
+	rendered := renderLogs(content)
+	m.logViewport.SetContent(rendered)
+	m.logContent = rendered
+	if m.autoScroll {
+		m.logViewport.GotoBottom()
+	}
+}
+
+func jobsPollCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
+		return jobsPollTickMsg{}
+	})
+}
+
 func logPollCmd() tea.Cmd {
-	// Poll faster (1 second) to catch logs as soon as they're available
-	return tea.Tick(1*time.Second, func(_ time.Time) tea.Msg {
+	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
 		return logPollTickMsg{}
 	})
 }
@@ -78,6 +127,27 @@ func rerunAllCmd(c *GitHubClient, runID int64) tea.Cmd {
 			return errMsg{err}
 		}
 		return rerunMsg{message: "Re-run triggered for all jobs!", runID: runID}
+	}
+}
+
+func fetchPipelineInfoCmd(c *GitHubClient, jobID int64) tea.Cmd {
+	return func() tea.Msg {
+		info, err := c.GetPipelineServiceInfo(jobID)
+		if err != nil {
+			dbg("fetchPipelineInfoCmd: %v", err)
+			return pipelineInfoMsg{info: nil}
+		}
+		return pipelineInfoMsg{info: info}
+	}
+}
+
+func fetchStepLogsCmd(info *pipelineServiceInfo, steps []Step, maxFetchedID int) tea.Cmd {
+	return func() tea.Msg {
+		content, newMax, err := FetchNewStepLogs(info, steps, maxFetchedID)
+		if err != nil {
+			return errMsg{err}
+		}
+		return stepLogsMsg{content: content, maxFetchedID: newMax}
 	}
 }
 
@@ -117,6 +187,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// While the log filter bar is active, handle input for the filter.
+		if m.state == stateLogs && m.logFilterMode {
+			switch msg.String() {
+			case "esc":
+				m.logFilter = ""
+				m.logFilterMode = false
+				m.applyLogFilter()
+				m.updateSizes()
+			case "enter":
+				m.logFilterMode = false
+				m.updateSizes()
+			case "backspace":
+				if len(m.logFilter) > 0 {
+					runes := []rune(m.logFilter)
+					m.logFilter = string(runes[:len(runes)-1])
+					m.applyLogFilter()
+				}
+			case "ctrl+u":
+				m.logFilter = ""
+				m.applyLogFilter()
+			case "up":
+				if m.logViewport.YOffset > 0 {
+					m.logViewport.YOffset--
+					m.autoScroll = false
+				}
+			case "down":
+				totalH := lipgloss.Height(m.logContent)
+				maxOff := max(0, totalH-m.logViewport.Height)
+				if m.logViewport.YOffset < maxOff {
+					m.logViewport.YOffset++
+				}
+				if m.logViewport.YOffset >= maxOff {
+					m.autoScroll = true
+				}
+			default:
+				if len(msg.Runes) > 0 {
+					m.logFilter += string(msg.Runes)
+					m.applyLogFilter()
+				}
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 
 		case "ctrl+c":
@@ -131,6 +244,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 
+		case "/":
+			if m.state == stateLogs && !isRunning(m.selectedJob.Status) {
+				m.logFilterMode = true
+				m.updateSizes()
+				return m, nil
+			}
+
 		case "enter":
 			switch m.state {
 			case stateRuns:
@@ -139,21 +259,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = stateJobs
 					m.loading = true
 					m.statusMsg = ""
+					m.jobsPolling = true
 					cmds = append(cmds, fetchJobsCmd(m.client, item.run.ID))
+					cmds = append(cmds, jobsPollCmd())
 					return m, tea.Batch(cmds...)
 				}
 			case stateJobs:
 				if item, ok := m.jobsList.SelectedItem().(jobItem); ok {
 					m.selectedJob = item.job
 					m.state = stateLogs
+					m.jobsPolling = false
 					m.logContent = ""
 					m.logRaw = ""
 					m.lastLogLength = 0
 					m.logLoaded = false
 					m.autoScroll = true
 					m.statusMsg = ""
+					m.logFilter = ""
+					m.logFilterMode = false
+					m.pipelineInfo = nil
+					m.stepLogsFetched = 0
 					m.updateSizes()
-					cmds = append(cmds, fetchLogsCmd(m.client, item.job.ID))
+					if isRunning(item.job.Status) {
+						// While running we show the steps view; just poll for job/step updates.
+						cmds = append(cmds, fetchJobsCmd(m.client, m.selectedRun.ID))
+						cmds = append(cmds, logPollCmd())
+					} else {
+						cmds = append(cmds, fetchLogsCmd(m.client, item.job.ID))
+					}
 					return m, tea.Batch(cmds...)
 				}
 			}
@@ -162,12 +295,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case stateJobs:
 				m.state = stateRuns
+				m.jobsPolling = false
+				m.jobsPollStartIDs = nil
 				m.statusMsg = ""
 				return m, nil
 			case stateLogs:
 				m.state = stateJobs
 				m.statusMsg = ""
-				return m, nil
+				m.jobsPolling = true
+				cmds = append(cmds, jobsPollCmd())
+				return m, tea.Batch(cmds...)
 			}
 			// stateRuns: fall through — let the list handle esc (clear filter)
 
@@ -175,15 +312,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case stateRuns:
 				if item, ok := m.runsList.SelectedItem().(runItem); ok {
+					m.statusMsg = "Triggering rerun of failed jobs…"
+					m.loading = true
 					cmds = append(cmds, rerunFailedCmd(m.client, item.run.ID))
 					return m, tea.Batch(cmds...)
 				}
 			case stateJobs:
+				m.statusMsg = "Triggering rerun of failed jobs…"
+				m.loading = true
 				cmds = append(cmds, rerunFailedCmd(m.client, m.selectedRun.ID))
 				return m, tea.Batch(cmds...)
 			case stateLogs:
 				m.logLoaded = false
-				cmds = append(cmds, fetchLogsCmd(m.client, m.selectedJob.ID))
+				m.lastLogLength = 0
+				m.logRaw = ""
+				m.logContent = ""
+				m.logFilter = ""
+				m.logFilterMode = false
+				m.pipelineInfo = nil
+				m.stepLogsFetched = 0
+				if isRunning(m.selectedJob.Status) {
+					cmds = append(cmds, fetchJobsCmd(m.client, m.selectedRun.ID))
+					cmds = append(cmds, logPollCmd())
+				} else {
+					cmds = append(cmds, fetchLogsCmd(m.client, m.selectedJob.ID))
+				}
 				return m, tea.Batch(cmds...)
 			}
 
@@ -191,10 +344,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			case stateRuns:
 				if item, ok := m.runsList.SelectedItem().(runItem); ok {
+					m.statusMsg = "Triggering rerun of all jobs…"
+					m.loading = true
 					cmds = append(cmds, rerunAllCmd(m.client, item.run.ID))
 					return m, tea.Batch(cmds...)
 				}
 			case stateJobs:
+				m.statusMsg = "Triggering rerun of all jobs…"
+				m.loading = true
 				cmds = append(cmds, rerunAllCmd(m.client, m.selectedRun.ID))
 				return m, tea.Batch(cmds...)
 			}
@@ -265,17 +422,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "pgup":
+			if m.state == stateLogs {
+				m.logViewport.YOffset = max(0, m.logViewport.YOffset-m.logViewport.Height/2)
+				m.autoScroll = false
+				return m, nil
+			}
+
 		case "down":
 			if m.state == stateLogs {
-				// Check if we're at the bottom
 				totalHeight := lipgloss.Height(m.logContent)
 				maxOffset := max(0, totalHeight-m.logViewport.Height)
-				
+
 				if m.logViewport.YOffset < maxOffset {
 					m.logViewport.YOffset++
 				}
-				
+
 				// Re-enable auto-scroll when at the bottom
+				if m.logViewport.YOffset >= maxOffset {
+					m.autoScroll = true
+					m.logViewport.GotoBottom()
+				}
+				return m, nil
+			}
+
+		case "pgdn":
+			if m.state == stateLogs {
+				totalHeight := lipgloss.Height(m.logContent)
+				maxOffset := max(0, totalHeight-m.logViewport.Height)
+				m.logViewport.YOffset = min(maxOffset, m.logViewport.YOffset+m.logViewport.Height/2)
 				if m.logViewport.YOffset >= maxOffset {
 					m.autoScroll = true
 					m.logViewport.GotoBottom()
@@ -306,17 +481,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case jobsLoadedMsg:
 		m.loading = false
+
+		// Phase 1 (after rerun): keep list empty until genuinely new job IDs appear.
+		if m.jobsPollStartIDs != nil {
+			hasNew := false
+			for _, j := range msg {
+				if !m.jobsPollStartIDs[j.ID] {
+					hasNew = true
+					break
+				}
+			}
+			if !hasNew {
+				break // new jobs not created yet; keep list empty, tick will retry
+			}
+			m.jobsPollStartIDs = nil // new jobs detected, exit waiting phase
+		}
+
+		runID := m.selectedRun.ID
+		oldJobs := m.lastJobsForRun[runID]
+
+		// Build items and detect first-time-seen jobs (for auto-jump).
 		items := make([]list.Item, len(msg))
 		for i, j := range msg {
 			items[i] = jobItem{j}
 		}
 		cmds = append(cmds, m.jobsList.SetItems(items))
-		
-		// Check for new jobs (auto-jump on rerun)
-		runID := m.selectedRun.ID
-		oldJobs := m.lastJobsForRun[runID]
-		
-		// Find new jobs that weren't in the old list
+
 		var newJobs []Job
 		for _, j := range msg {
 			found := false
@@ -330,10 +520,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				newJobs = append(newJobs, j)
 			}
 		}
-		
-		// If we're in stateJobs and there are new jobs, select the first one
 		if m.state == stateJobs && len(newJobs) > 0 {
-			// Find the index of the new job and auto-select it
 			for i, item := range items {
 				if ji, ok := item.(jobItem); ok && ji.job.ID == newJobs[0].ID {
 					m.jobsList.Select(i)
@@ -342,15 +529,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		
-		// Update the cache for this run
+
+		// Update the cache.
 		m.lastJobsForRun[runID] = msg
-		
-		// Keep selectedJob in sync while viewing logs
+
+
+		// Keep selectedJob in sync while viewing logs.
 		if m.state == stateLogs {
 			for _, j := range msg {
 				if j.ID == m.selectedJob.ID {
+					wasRunning := isRunning(m.selectedJob.Status)
 					m.selectedJob = j
+					isNowDone := wasRunning && !isRunning(m.selectedJob.Status)
+					if isNowDone {
+						// Job just completed — fetch the full log.
+						m.pipelineInfo = nil
+						cmds = append(cmds, fetchLogsCmd(m.client, m.selectedJob.ID))
+					}
 					break
 				}
 			}
@@ -358,56 +553,82 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logsLoadedMsg:
 		rawContent := string(msg)
-		
-		// If empty and job is still running, show waiting message
-		if rawContent == "" && m.selectedJob.Status == "in_progress" {
-			waitingMsg := "⏳ Job is running, logs will appear here when complete...\n\n" +
-				"💡 Tip: Press 'o' to open the job in your browser for live logs\n" +
-				"💡 Tip: Press 'a' to toggle auto-scroll when logs appear"
-			m.logContent = waitingMsg
-			m.logRaw = ""
-			m.logLoaded = true
-			m.logViewport.SetContent(waitingMsg)
-		} else if rawContent != "" {
-			// Detect if this is an incremental update
-			isNewContent := len(rawContent) > m.lastLogLength
-			
-			rendered := renderLogs(rawContent)
-			savedOffset := m.logViewport.YOffset
-			m.logViewport.SetContent(rendered)
-			m.logContent = rendered
+		dbg("logsLoadedMsg: %d bytes, jobStatus=%s", len(rawContent), m.selectedJob.Status)
+		if rawContent != "" {
 			m.logRaw = rawContent
 			m.lastLogLength = len(rawContent)
 			m.logLoaded = true
-			
-			// Auto-scroll on new content, or if not already scrolled up
-			if m.autoScroll || (isNewContent && m.logViewport.YOffset == 0) {
-				m.logViewport.GotoBottom()
-			} else if !isNewContent {
-				// No new content, preserve scroll position
-				m.logViewport.YOffset = savedOffset
-			}
-		}
-		// Continue polling while viewing logs to enable live log streaming
-		if m.state == stateLogs {
-			cmds = append(cmds, logPollCmd())
+			m.applyLogFilter()
+		} else if !m.logLoaded {
+			waitingMsg := "Waiting for logs..."
+			m.logViewport.SetContent(waitingMsg)
+			m.logContent = waitingMsg
+			m.logLoaded = true
 		}
 
 	case logPollTickMsg:
 		if m.state == stateLogs {
-			cmds = append(cmds, fetchLogsCmd(m.client, m.selectedJob.ID))
-			cmds = append(cmds, fetchJobsCmd(m.client, m.selectedRun.ID))
+			if isRunning(m.selectedJob.Status) {
+				// Steps view: just refresh job/step status, no log fetch needed.
+				cmds = append(cmds, fetchJobsCmd(m.client, m.selectedRun.ID))
+				cmds = append(cmds, logPollCmd())
+			} else {
+				// Job finished while we were polling — fetch the full log.
+				cmds = append(cmds, fetchLogsCmd(m.client, m.selectedJob.ID))
+			}
 		}
 
 	case rerunMsg:
 		m.statusMsg = msg.message
-		m.loading = true
-		// After rerun, refresh jobs for this run and potentially auto-jump
-		cmds = append(cmds, fetchJobsCmd(m.client, msg.runID))
+		// Snapshot current job IDs so we can detect when genuinely new ones appear.
+		m.jobsPollStartIDs = make(map[int64]bool)
+		for _, item := range m.jobsList.Items() {
+			if ji, ok := item.(jobItem); ok {
+				m.jobsPollStartIDs[ji.job.ID] = true
+			}
+		}
+		if m.state == stateJobs {
+			// Clear the list immediately — new jobs will appear via the running poll.
+			cmds = append(cmds, m.jobsList.SetItems([]list.Item{}))
+		}
+		if !m.jobsPolling {
+			// Triggered from stateRuns; start polling now.
+			m.jobsPolling = true
+			cmds = append(cmds, jobsPollCmd())
+		}
+
+	case jobsPollTickMsg:
+		if m.jobsPolling {
+			if m.state == stateJobs {
+				cmds = append(cmds, fetchJobsCmd(m.client, m.selectedRun.ID))
+			}
+			cmds = append(cmds, jobsPollCmd()) // always keep the chain alive
+		}
 
 	case errMsg:
 		m.loading = false
 		m.statusMsg = fmt.Sprintf("error: %v", msg.err)
+
+	case pipelineInfoMsg:
+		m.pipelineInfo = msg.info
+
+	case stepLogsMsg:
+		if msg.maxFetchedID > m.stepLogsFetched {
+			m.stepLogsFetched = msg.maxFetchedID
+			if msg.content != "" {
+				if m.logRaw != "" {
+					m.logRaw += "\n"
+				}
+				m.logRaw += msg.content
+				m.logLoaded = true
+				m.applyLogFilter()
+			} else if !m.logLoaded {
+				waitingMsg := "Waiting for step logs..."
+				m.logViewport.SetContent(waitingMsg)
+				m.logContent = waitingMsg
+				m.logLoaded = true
+			}
+		}
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -436,7 +657,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateSizes resizes the log viewport to fit the current terminal dimensions.
 func (m *model) updateSizes() {
-	h := max(1, m.height-4)
+	extra := 0
+	if m.logFilterMode {
+		extra = 1
+	}
+	h := max(1, m.height-4-extra)
 	savedOffset := m.logViewport.YOffset
 	m.logViewport.Width = m.width
 	m.logViewport.Height = h
