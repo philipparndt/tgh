@@ -58,6 +58,14 @@ Run against a specific repository path:
 tgh /path/to/repo
 ```
 
+Run against a GitHub repository by URL:
+
+```sh
+tgh https://github.com/owner/repo
+tgh https://github1.example.com/owner/repo
+tgh git@github.com:owner/repo.git
+```
+
 Enable debug logging to a file:
 
 ```sh
