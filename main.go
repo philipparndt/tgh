@@ -9,6 +9,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,9 +19,13 @@ import (
 type viewState int
 
 const (
-	stateRuns viewState = iota // list of workflow runs
-	stateJobs                  // jobs for a selected run
-	stateLogs                  // live log viewer for a selected job
+	stateMenu          viewState = iota // main menu
+	stateRuns                           // list of workflow runs
+	stateJobs                           // jobs for a selected run
+	stateLogs                           // live log viewer for a selected job
+	statePRs                            // list of open pull requests
+	stateWorkflows                      // workflow dispatch picker
+	stateDispatchForm                   // form to fill inputs before dispatching
 )
 
 // model is the root Bubble Tea model.
@@ -29,48 +34,71 @@ type model struct {
 	width, height int
 	client        *GitHubClient
 
+	// stateMenu
+	menuIndex int
+
 	// stateRuns
-	runsList list.Model
+	runsList    list.Model
+	runsPolling bool
 
 	// stateJobs
 	selectedRun      WorkflowRun
 	jobsList         list.Model
-	jobsPolling      bool            // true while polling for job status updates
-	jobsPollStartIDs map[int64]bool  // job IDs snapshot at rerun time; non-nil = waiting for new IDs
+	jobsPolling      bool
+	jobsPollStartIDs map[int64]bool
 
 	// stateLogs
-	selectedJob    Job
-	logViewport    viewport.Model
-	logContent     string // rendered content with styling
-	logRaw         string // raw log content (unrendered)
-	logLoaded      bool
-	autoScroll     bool
-	lastLogLength  int // track log size to detect incremental updates
+	selectedJob   Job
+	logViewport   viewport.Model
+	logContent    string // rendered content with styling
+	logRaw        string // raw log content (unrendered)
+	logLoaded     bool
+	autoScroll    bool
+	lastLogLength int // track log size to detect incremental updates
 
 	// live streaming (running jobs)
-	liveStreaming      bool   // currently using the undocumented live endpoint
-	liveChangeID       int    // cursor for the next change_id request
-	liveLogs           string // accumulated raw log content from live stream
-	liveFailedAttempts int    // consecutive attempts that returned endpointOK=false
+	liveStreaming      bool
+	liveChangeID       int
+	liveLogs           string
+	liveFailedAttempts int
 
 	// blob range polling (fallback for running jobs)
-	logBlobURL    string // Azure blob URL obtained from the REST redirect
-	logBlobOffset int64  // next byte offset for Range requests
+	logBlobURL    string
+	logBlobOffset int64
 
 	// GHES per-step log fetching
-	pipelineInfo    *pipelineServiceInfo // non-nil when on GHES with a running job
-	stepLogsFetched int                  // max log record ID fetched via pipeline service
+	pipelineInfo    *pipelineServiceInfo
+	stepLogsFetched int
 
 	// log filter
-	logFilter     string // current filter text (empty = no filter)
-	logFilterMode bool   // true while filter bar is focused
+	logFilter     string
+	logFilterMode bool
+
+	// statePRs
+	prsList    list.Model
+	selectedPR *PullRequest // non-nil when viewing runs for a specific PR
+
+	// stateWorkflows
+	workflowsList list.Model
+	defaultBranch string
+
+	// stateDispatchForm
+	selectedWorkflow Workflow
+	formFields       []formField
+	formActiveField  int
+	formButton       int      // 0=field focused, 1=Cancel focused, 2=Build focused
+	refBranches      []string // all branch names (from API)
+	refTags          []string // all tag names (from API)
+	refSection       int      // 0=input, 1=branches, 2=tags
+	refBranchIdx     int      // selected index in filtered branch list
+	refTagIdx        int      // selected index in filtered tag list
 
 	// shared
-	spinner   spinner.Model
-	loading   bool
-	statusMsg string
-	err       error
-	lastJobsForRun map[int64][]Job // track previous jobs to detect new ones on rerun
+	spinner        spinner.Model
+	loading        bool
+	statusMsg      string
+	err            error
+	lastJobsForRun map[int64][]Job
 }
 
 // ─── List item types ──────────────────────────────────────────────────────────
@@ -82,6 +110,25 @@ func (r runItem) FilterValue() string { return r.run.Name + " " + r.run.HeadBran
 type jobItem struct{ job Job }
 
 func (j jobItem) FilterValue() string { return j.job.Name }
+
+type prItem struct{ pr PullRequest }
+
+func (p prItem) FilterValue() string { return fmt.Sprintf("#%d %s", p.pr.Number, p.pr.Title) }
+
+type workflowItem struct{ wf Workflow }
+
+func (w workflowItem) FilterValue() string { return w.wf.Name }
+
+// formField holds one field in the workflow dispatch form.
+type formField struct {
+	label       string
+	description string
+	fieldType   string   // "ref", "string", "boolean", "choice", "environment"
+	options     []string // for "choice" type
+	required    bool
+	optionIdx   int // current selected index for choice/boolean cycling
+	input       textinput.Model
+}
 
 // ─── Custom delegates (k9s-style single-line table rows) ─────────────────────
 
@@ -96,26 +143,19 @@ func (d runDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 		return
 	}
 	selected := index == m.Index()
-	
 	if selected {
-		// For selected rows, render as plain text first, then apply background
 		row := formatRunRowPlain(ri.run, d.width)
-		// Pad to full width
 		visWidth := lipgloss.Width(row)
 		if visWidth < d.width {
 			row = row + strings.Repeat(" ", d.width-visWidth)
 		}
-		// Apply background style
 		style := lipgloss.NewStyle().
 			Background(lipgloss.Color("63")).
 			Foreground(lipgloss.Color("15")).
 			Bold(true)
-		row = style.Render(row)
-		fmt.Fprint(w, row)
+		fmt.Fprint(w, style.Render(row))
 	} else {
-		// For unselected rows, use styled version
-		row := formatRunRow(ri.run, d.width, false)
-		fmt.Fprint(w, normalItemStyle.Render(row))
+		fmt.Fprint(w, normalItemStyle.Render(formatRunRow(ri.run, d.width, false)))
 	}
 }
 
@@ -130,26 +170,73 @@ func (d jobDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 		return
 	}
 	selected := index == m.Index()
-	
 	if selected {
-		// For selected rows, render as plain text first, then apply background
 		row := formatJobRowPlain(ji.job, d.width)
-		// Pad to full width
 		visWidth := lipgloss.Width(row)
 		if visWidth < d.width {
 			row = row + strings.Repeat(" ", d.width-visWidth)
 		}
-		// Apply background style
 		style := lipgloss.NewStyle().
 			Background(lipgloss.Color("63")).
 			Foreground(lipgloss.Color("15")).
 			Bold(true)
-		row = style.Render(row)
-		fmt.Fprint(w, row)
+		fmt.Fprint(w, style.Render(row))
 	} else {
-		// For unselected rows, use styled version
-		row := formatJobRow(ji.job, d.width, false)
-		fmt.Fprint(w, normalItemStyle.Render(row))
+		fmt.Fprint(w, normalItemStyle.Render(formatJobRow(ji.job, d.width, false)))
+	}
+}
+
+type prDelegate struct{ width int }
+
+func (d prDelegate) Height() int                             { return 1 }
+func (d prDelegate) Spacing() int                           { return 0 }
+func (d prDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+func (d prDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	pi, ok := item.(prItem)
+	if !ok {
+		return
+	}
+	selected := index == m.Index()
+	if selected {
+		row := formatPRRowPlain(pi.pr, d.width)
+		visWidth := lipgloss.Width(row)
+		if visWidth < d.width {
+			row = row + strings.Repeat(" ", d.width-visWidth)
+		}
+		style := lipgloss.NewStyle().
+			Background(lipgloss.Color("63")).
+			Foreground(lipgloss.Color("15")).
+			Bold(true)
+		fmt.Fprint(w, style.Render(row))
+	} else {
+		fmt.Fprint(w, normalItemStyle.Render(formatPRRow(pi.pr, d.width)))
+	}
+}
+
+type workflowDelegate struct{ width int }
+
+func (d workflowDelegate) Height() int                             { return 1 }
+func (d workflowDelegate) Spacing() int                           { return 0 }
+func (d workflowDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+func (d workflowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	wi, ok := item.(workflowItem)
+	if !ok {
+		return
+	}
+	selected := index == m.Index()
+	if selected {
+		row := formatWorkflowRowPlain(wi.wf, d.width)
+		visWidth := lipgloss.Width(row)
+		if visWidth < d.width {
+			row = row + strings.Repeat(" ", d.width-visWidth)
+		}
+		style := lipgloss.NewStyle().
+			Background(lipgloss.Color("63")).
+			Foreground(lipgloss.Color("15")).
+			Bold(true)
+		fmt.Fprint(w, style.Render(row))
+	} else {
+		fmt.Fprint(w, normalItemStyle.Render(formatWorkflowRow(wi.wf, d.width)))
 	}
 }
 
@@ -157,7 +244,7 @@ func (d jobDelegate) Render(w io.Writer, m list.Model, index int, item list.Item
 
 func formatRunRow(r WorkflowRun, width int, selected bool) string {
 	const (
-		cursorW = 2  // "▶ " or "  "
+		cursorW = 2
 		iconW   = 2
 		branchW = 22
 		eventW  = 11
@@ -168,7 +255,7 @@ func formatRunRow(r WorkflowRun, width int, selected bool) string {
 
 	cursor := "  "
 	if selected {
-		cursor = "▶ " // Don't style here - let delegate handle the full line styling
+		cursor = "▶ "
 	}
 	icon := statusIcon(r.Status, r.Conclusion)
 	name := truncate(r.Name, nameW)
@@ -176,13 +263,9 @@ func formatRunRow(r WorkflowRun, width int, selected bool) string {
 	event := truncate(r.Event, eventW)
 	age := relativeTime(r.CreatedAt)
 
-	// Build row without inner widths - just raw text
-	row := cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(branch, branchW) + " " + padRight(event, eventW) + " " + padRight(age, ageW)
-	
-	return row
+	return cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(branch, branchW) + " " + padRight(event, eventW) + " " + padRight(age, ageW)
 }
 
-// formatRunRowPlain builds a run row as plain text with no styling
 func formatRunRowPlain(r WorkflowRun, width int) string {
 	const (
 		cursorW = 2
@@ -194,16 +277,13 @@ func formatRunRowPlain(r WorkflowRun, width int) string {
 	)
 	nameW := max(8, width-cursorW-iconW-branchW-eventW-ageW-gaps)
 
-	cursor := "▶ "
-	// Get plain icon without styling
 	icon := getPlainStatusIcon(r.Status, r.Conclusion)
 	name := truncate(r.Name, nameW)
 	branch := truncate(r.HeadBranch, branchW)
 	event := truncate(r.Event, eventW)
 	age := relativeTime(r.CreatedAt)
 
-	row := cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(branch, branchW) + " " + padRight(event, eventW) + " " + padRight(age, ageW)
-	return row
+	return "▶  " + icon + " " + padRight(name, nameW) + " " + padRight(branch, branchW) + " " + padRight(event, eventW) + " " + padRight(age, ageW)
 }
 
 func formatJobRow(j Job, width int, selected bool) string {
@@ -218,7 +298,7 @@ func formatJobRow(j Job, width int, selected bool) string {
 
 	cursor := "  "
 	if selected {
-		cursor = "▶ " // Don't style here - let delegate handle the full line styling
+		cursor = "▶ "
 	}
 	icon := statusIcon(j.Status, j.Conclusion)
 	name := truncate(j.Name, nameW)
@@ -234,13 +314,9 @@ func formatJobRow(j Job, width int, selected bool) string {
 	}
 	duration := truncate(dur, durationW)
 
-	// Build row without inner widths - just raw text
-	row := cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(status, statusW) + " " + padRight(duration, durationW)
-	
-	return row
+	return cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(status, statusW) + " " + padRight(duration, durationW)
 }
 
-// formatJobRowPlain builds a job row as plain text with no styling
 func formatJobRowPlain(j Job, width int) string {
 	const (
 		cursorW   = 2
@@ -251,8 +327,6 @@ func formatJobRowPlain(j Job, width int) string {
 	)
 	nameW := max(8, width-cursorW-iconW-statusW-durationW-gaps)
 
-	cursor := "▶ "
-	// Get plain icon without styling
 	icon := getPlainStatusIcon(j.Status, j.Conclusion)
 	name := truncate(j.Name, nameW)
 	status := truncate(statusLabel(j.Status, j.Conclusion), statusW)
@@ -267,8 +341,79 @@ func formatJobRowPlain(j Job, width int) string {
 	}
 	duration := truncate(dur, durationW)
 
-	row := cursor + " " + icon + " " + padRight(name, nameW) + " " + padRight(status, statusW) + " " + padRight(duration, durationW)
-	return row
+	return "▶  " + icon + " " + padRight(name, nameW) + " " + padRight(status, statusW) + " " + padRight(duration, durationW)
+}
+
+func formatPRRow(pr PullRequest, width int) string {
+	const (
+		cursorW = 3
+		numW    = 6
+		branchW = 18
+		authorW = 14
+		ageW    = 8
+		gaps    = 4
+	)
+	titleW := max(8, width-cursorW-numW-branchW-authorW-ageW-gaps)
+
+	num := truncate(fmt.Sprintf("#%d", pr.Number), numW)
+	title := truncate(pr.Title, titleW)
+	branch := truncate(pr.Head.Ref, branchW)
+	author := truncate(pr.User.Login, authorW)
+	age := relativeTime(pr.UpdatedAt)
+
+	return "    " + padRight(num, numW) + " " + padRight(title, titleW) + " " + padRight(branch, branchW) + " " + padRight(author, authorW) + " " + padRight(age, ageW)
+}
+
+func formatPRRowPlain(pr PullRequest, width int) string {
+	const (
+		cursorW = 3
+		numW    = 6
+		branchW = 18
+		authorW = 14
+		ageW    = 8
+		gaps    = 4
+	)
+	titleW := max(8, width-cursorW-numW-branchW-authorW-ageW-gaps)
+
+	num := truncate(fmt.Sprintf("#%d", pr.Number), numW)
+	title := truncate(pr.Title, titleW)
+	branch := truncate(pr.Head.Ref, branchW)
+	author := truncate(pr.User.Login, authorW)
+	age := relativeTime(pr.UpdatedAt)
+
+	return "▶   " + padRight(num, numW) + " " + padRight(title, titleW) + " " + padRight(branch, branchW) + " " + padRight(author, authorW) + " " + padRight(age, ageW)
+}
+
+func formatWorkflowRow(wf Workflow, width int) string {
+	const (
+		cursorW = 3
+		fileW   = 30
+		gaps    = 1
+	)
+	nameW := max(8, width-cursorW-fileW-gaps)
+
+	filename := wf.Path
+	if idx := strings.LastIndex(filename, "/"); idx >= 0 {
+		filename = filename[idx+1:]
+	}
+
+	return "    " + padRight(truncate(filename, fileW), fileW) + " " + truncate(wf.Name, nameW)
+}
+
+func formatWorkflowRowPlain(wf Workflow, width int) string {
+	const (
+		cursorW = 3
+		fileW   = 30
+		gaps    = 1
+	)
+	nameW := max(8, width-cursorW-fileW-gaps)
+
+	filename := wf.Path
+	if idx := strings.LastIndex(filename, "/"); idx >= 0 {
+		filename = filename[idx+1:]
+	}
+
+	return "▶   " + padRight(truncate(filename, fileW), fileW) + " " + truncate(wf.Name, nameW)
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -283,7 +428,6 @@ func padRight(s string, n int) string {
 }
 
 // padToWidth right-pads s with spaces so its visible width equals n.
-// It measures s using lipgloss (ANSI-aware), so embedded colour codes are ignored.
 func padToWidth(s string, n int) string {
 	vis := lipgloss.Width(s)
 	if vis < n {
@@ -323,10 +467,84 @@ func relativeTime(t time.Time) string {
 	}
 }
 
+// filterRefs returns the subset of refs whose name contains the lower-cased filter string.
+// Returns the original slice unchanged when filter is empty.
+func filterRefs(refs []string, lower string) []string {
+	if lower == "" {
+		return refs
+	}
+	var out []string
+	for _, r := range refs {
+		if strings.Contains(strings.ToLower(r), lower) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// buildDispatchFormFields constructs the form fields for a workflow dispatch form.
+// Field 0 is always the ref/branch/tag field; subsequent fields correspond to
+// the workflow's workflow_dispatch inputs in the order they appear in the YAML.
+func buildDispatchFormFields(inputs []WorkflowInput, defaultRef string) []formField {
+	newInput := func(value string) textinput.Model {
+		ti := textinput.New()
+		ti.Width = 60
+		ti.Prompt = "> "
+		ti.SetValue(value)
+		return ti
+	}
+
+	refInput := newInput(defaultRef)
+	fields := []formField{
+		{
+			label:     "ref / branch / tag",
+			fieldType: "ref",
+			input:     refInput,
+		},
+	}
+
+	for _, inp := range inputs {
+		ft := inp.Type
+		if ft == "" {
+			ft = "string"
+		}
+		f := formField{
+			label:       inp.Name,
+			description: inp.Description,
+			fieldType:   ft,
+			options:     inp.Options,
+			required:    inp.Required,
+		}
+		switch ft {
+		case "boolean":
+			val := "false"
+			if inp.Default == "true" {
+				val = "true"
+			}
+			f.input = newInput(val)
+		case "choice":
+			for i, opt := range inp.Options {
+				if opt == inp.Default {
+					f.optionIdx = i
+					break
+				}
+			}
+			val := inp.Default
+			if val == "" && len(inp.Options) > 0 {
+				val = inp.Options[0]
+			}
+			f.input = newInput(val)
+		default:
+			f.input = newInput(inp.Default)
+		}
+		fields = append(fields, f)
+	}
+	return fields
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
-	// Parse command-line arguments
 	var repoPath string
 	var debugFile string
 
@@ -362,7 +580,6 @@ func main() {
 
 	initDebugLog(debugFile)
 
-	// Create GitHub client with optional repo path
 	client, err := NewGitHubClient(repoPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -389,18 +606,35 @@ func main() {
 	jobsList.SetFilteringEnabled(false)
 	jobsList.DisableQuitKeybindings()
 
+	pdel := prDelegate{width: 80}
+	prsList := list.New([]list.Item{}, pdel, 80, 20)
+	prsList.SetShowTitle(false)
+	prsList.SetShowStatusBar(false)
+	prsList.SetShowPagination(false)
+	prsList.SetFilteringEnabled(false)
+	prsList.DisableQuitKeybindings()
+
+	wdel := workflowDelegate{width: 80}
+	workflowsList := list.New([]list.Item{}, wdel, 80, 20)
+	workflowsList.SetShowTitle(false)
+	workflowsList.SetShowStatusBar(false)
+	workflowsList.SetShowPagination(false)
+	workflowsList.SetFilteringEnabled(false)
+	workflowsList.DisableQuitKeybindings()
+
 	vp := viewport.New(80, 20)
 
 	m := model{
-		state:           stateRuns,
-		client:          client,
-		runsList:        runsList,
-		jobsList:        jobsList,
-		logViewport:     vp,
-		spinner:         s,
-		loading:         true,
-		autoScroll:      true,
-		lastJobsForRun:  make(map[int64][]Job),
+		state:          stateMenu,
+		client:         client,
+		runsList:       runsList,
+		jobsList:       jobsList,
+		prsList:        prsList,
+		workflowsList:  workflowsList,
+		logViewport:    vp,
+		spinner:        s,
+		autoScroll:     true,
+		lastJobsForRun: make(map[int64][]Job),
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

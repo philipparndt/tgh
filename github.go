@@ -22,6 +22,7 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/cli/go-gh/v2/pkg/repository"
+	"gopkg.in/yaml.v3"
 )
 
 // ─── Debug logging ────────────────────────────────────────────────────────────
@@ -610,6 +611,251 @@ func (c *GitHubClient) RerunAll(runID int64) error {
 		fmt.Sprintf("repos/%s/%s/actions/runs/%d/rerun", c.owner, c.repo, runID),
 		nil, nil,
 	)
+}
+
+// ─── Pull Requests ────────────────────────────────────────────────────────────
+
+// PullRequest represents a GitHub pull request.
+type PullRequest struct {
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	State     string    `json:"state"`
+	Draft     bool      `json:"draft"`
+	UpdatedAt time.Time `json:"updated_at"`
+	HTMLURL   string    `json:"html_url"`
+	User      struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Head struct {
+		SHA string `json:"sha"`
+		Ref string `json:"ref"`
+	} `json:"head"`
+}
+
+// ListPullRequests returns open pull requests sorted by most-recently-updated.
+func (c *GitHubClient) ListPullRequests() ([]PullRequest, error) {
+	var result []PullRequest
+	err := c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/pulls?state=open&per_page=50&sort=updated&direction=desc", c.owner, c.repo),
+		&result,
+	)
+	return result, err
+}
+
+// ListRunsForPR fetches workflow runs associated with a specific commit SHA.
+func (c *GitHubClient) ListRunsForPR(headSHA string) ([]WorkflowRun, error) {
+	var result struct {
+		WorkflowRuns []WorkflowRun `json:"workflow_runs"`
+	}
+	err := c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/actions/runs?head_sha=%s&per_page=50", c.owner, c.repo, headSHA),
+		&result,
+	)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result.WorkflowRuns, func(i, j int) bool {
+		return result.WorkflowRuns[i].UpdatedAt.After(result.WorkflowRuns[j].UpdatedAt)
+	})
+	return result.WorkflowRuns, nil
+}
+
+// ─── Workflow dispatch ────────────────────────────────────────────────────────
+
+// Workflow represents a GitHub Actions workflow file.
+type Workflow struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	State string `json:"state"` // "active", "disabled_manually", etc.
+}
+
+// WorkflowInput represents a single input defined in a workflow_dispatch trigger.
+type WorkflowInput struct {
+	Name        string
+	Description string
+	Required    bool
+	Default     string
+	Type        string   // "string", "boolean", "choice", "environment"
+	Options     []string // for "choice" type, in YAML order
+}
+
+// ListWorkflows returns all active workflows in the repository.
+func (c *GitHubClient) ListWorkflows() ([]Workflow, error) {
+	var result struct {
+		Workflows []Workflow `json:"workflows"`
+	}
+	if err := c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/actions/workflows?per_page=100", c.owner, c.repo),
+		&result,
+	); err != nil {
+		return nil, err
+	}
+	var active []Workflow
+	for _, w := range result.Workflows {
+		if w.State == "active" {
+			active = append(active, w)
+		}
+	}
+	return active, nil
+}
+
+// GetDefaultBranch returns the repository's default branch name.
+func (c *GitHubClient) GetDefaultBranch() (string, error) {
+	var repo struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	err := c.rest.Get(fmt.Sprintf("repos/%s/%s", c.owner, c.repo), &repo)
+	return repo.DefaultBranch, err
+}
+
+// TriggerWorkflowDispatch triggers a workflow_dispatch event on the given ref with optional inputs.
+func (c *GitHubClient) TriggerWorkflowDispatch(workflowID int64, ref string, inputs map[string]string) error {
+	if inputs == nil {
+		inputs = map[string]string{}
+	}
+	payload := struct {
+		Ref    string            `json:"ref"`
+		Inputs map[string]string `json:"inputs"`
+	}{
+		Ref:    ref,
+		Inputs: inputs,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return c.rest.Post(
+		fmt.Sprintf("repos/%s/%s/actions/workflows/%d/dispatches", c.owner, c.repo, workflowID),
+		bytes.NewReader(data), nil,
+	)
+}
+
+// ListRefs returns branch names and tag names for the repository as separate slices.
+func (c *GitHubClient) ListRefs() (branches, tags []string, err error) {
+	type nameOnly struct {
+		Name string `json:"name"`
+	}
+	var bs []nameOnly
+	if err = c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/branches?per_page=100", c.owner, c.repo),
+		&bs,
+	); err != nil {
+		return
+	}
+	var ts []nameOnly
+	if err = c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/tags?per_page=100", c.owner, c.repo),
+		&ts,
+	); err != nil {
+		return
+	}
+	branches = make([]string, len(bs))
+	for i, b := range bs {
+		branches[i] = b.Name
+	}
+	tags = make([]string, len(ts))
+	for i, t := range ts {
+		tags[i] = t.Name
+	}
+	return
+}
+
+// GetWorkflowInputs fetches and parses workflow_dispatch inputs from a workflow YAML file.
+// Returns nil inputs (and no error) when the workflow has no workflow_dispatch trigger or no inputs.
+func (c *GitHubClient) GetWorkflowInputs(workflowPath string) ([]WorkflowInput, error) {
+	var fileContent struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	path := strings.TrimPrefix(workflowPath, "/")
+	if err := c.rest.Get(
+		fmt.Sprintf("repos/%s/%s/contents/%s", c.owner, c.repo, path),
+		&fileContent,
+	); err != nil {
+		return nil, err
+	}
+	// GitHub API encodes file content as base64 with embedded newlines.
+	raw := strings.ReplaceAll(fileContent.Content, "\n", "")
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode workflow YAML: %w", err)
+	}
+	return parseWorkflowInputs(data)
+}
+
+// parseWorkflowInputs extracts workflow_dispatch input definitions from workflow YAML.
+// Uses yaml.Node to preserve the order of inputs as defined in the file.
+func parseWorkflowInputs(data []byte) ([]WorkflowInput, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return nil, nil
+	}
+	root := doc.Content[0]
+
+	onNode := findMappingValue(root, "on")
+	if onNode == nil || onNode.Kind != yaml.MappingNode {
+		return nil, nil
+	}
+
+	wdNode := findMappingValue(onNode, "workflow_dispatch")
+	if wdNode == nil || wdNode.Kind != yaml.MappingNode {
+		return nil, nil
+	}
+
+	inputsNode := findMappingValue(wdNode, "inputs")
+	if inputsNode == nil || inputsNode.Kind != yaml.MappingNode {
+		return nil, nil
+	}
+
+	var inputs []WorkflowInput
+	for i := 0; i+1 < len(inputsNode.Content); i += 2 {
+		nameNode := inputsNode.Content[i]
+		valNode := inputsNode.Content[i+1]
+
+		inp := WorkflowInput{Name: nameNode.Value}
+		if valNode != nil && valNode.Kind == yaml.MappingNode {
+			for j := 0; j+1 < len(valNode.Content); j += 2 {
+				k := valNode.Content[j].Value
+				v := valNode.Content[j+1]
+				switch k {
+				case "description":
+					inp.Description = v.Value
+				case "required":
+					inp.Required = v.Value == "true"
+				case "default":
+					inp.Default = v.Value
+				case "type":
+					inp.Type = v.Value
+				case "options":
+					if v.Kind == yaml.SequenceNode {
+						for _, opt := range v.Content {
+							inp.Options = append(inp.Options, opt.Value)
+						}
+					}
+				}
+			}
+		}
+		inputs = append(inputs, inp)
+	}
+	return inputs, nil
+}
+
+// findMappingValue returns the value node for the given key in a YAML mapping node.
+// Returns nil if the node is not a mapping or the key is not found.
+func findMappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 // ─── GHES pipeline service (per-step log fetching) ───────────────────────────
